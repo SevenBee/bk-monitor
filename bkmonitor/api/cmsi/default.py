@@ -12,12 +12,14 @@ specific language governing permissions and limitations under the License.
 import abc
 import base64
 import json
+from copy import deepcopy
+from typing import Dict, List, Union
 
 import six
 from django.conf import settings
-from django.utils.translation import ugettext as _
 from rest_framework import serializers
 
+from core.drf_resource import api
 from core.drf_resource.contrib.api import APIResource
 from core.errors.api import BKAPIError
 
@@ -47,19 +49,69 @@ class CheckCMSIResource(CMSIBaseResource):
         }
     """
 
-    def perform_request(self, validated_request_data):
+    def perform_request(self, validated_request_data: Dict[str, Union[List[str], any]]):
         """
-        进行
+        发送请求
+
+        receivers: 接收者, 用于返回时的接收者报错用
         """
+        # 待返回数据格式， 假定默认都是成功发送
+        response_data = {
+            "username_check": {"invalid": []},
+            "message": "发送成功",
+        }
+
+        message_detail = {}
+
+        # 获取 receiver__username:str, receiver: str --> revie
+
         if validated_request_data.get("receiver__username"):
-            receivers = validated_request_data["receiver__username"].split(",")
+            if settings.BK_USERINFO_API_BASE_URL and isinstance(self, (SendMail, SendSms)):
+                receivers_username: str = deepcopy(validated_request_data["receiver__username"])
+                receivers = receivers_username.split(",")
+                receivers_info = {}
+
+                # 获取用户信息
+                param = {"usernames": validated_request_data["receiver__username"], "fields": "email,phone"}
+                receivers_info = api.cmsi.get_user_sensitive_info(**param)["data"]
+
+                # 转化格式  -> {username: { "email": email, "phone": phone }}
+                # e.g. {"zhangsan": {"email": "zhangsan@qq.com", "phone": "+8612312312345"}}
+                receivers_info = {
+                    receiver["username"]: {
+                        "email": receiver["email"],
+                        "phone": f"+{receiver['phone_country_code']}{receiver['phone']}",
+                    }
+                    for receiver in receivers_info
+                }
+
+                # 提前获取失败原因为 "用户不存在" 的用户, 并且不会他们进行发送
+                not_exist_usernames = [
+                    username for username in receivers_username.split(",") if username not in receivers_info.keys()
+                ]
+                message_detail.update({username: "用户不存在" for username in not_exist_usernames})
+
+                # 删除不存在的用户无需给发送内容
+                receivers = list(set(receivers) - set(not_exist_usernames))
+
+                # 对应不同的子类，转化对应的receivers返回出去
+                if isinstance(self, SendMail):
+                    validated_request_data["receiver"] = ",".join([info["email"] for info in receivers_info.values()])
+                if isinstance(self, SendSms):
+                    validated_request_data["receiver"] = ",".join([info["phone"] for info in receivers_info.values()])
+            else:
+                receivers = validated_request_data["receiver__username"]
         elif isinstance(validated_request_data["receiver"], list):
             receivers = validated_request_data["receiver"]
         else:
             receivers = validated_request_data["receiver"].split(",")
+
         try:
             super(CMSIBaseResource, self).perform_request(validated_request_data)
-            return {"username_check": {"invalid": []}, "message": _("发送成功")}
+
+            response_data["message_detail"] = message_detail
+            return response_data
+
         except BKAPIError as e:
             invalid = receivers
             if isinstance(e.data, dict):
@@ -70,11 +122,25 @@ class CheckCMSIResource(CMSIBaseResource):
                 if not invalid:
                     # 如果在错误结果情况下，返回的invalid用户为空的时候，判断所有的用户为失败
                     invalid = receivers
-            return {"username_check": {"invalid": invalid}, "message": str(e)}
+
+            response_data["username_check"]["invalid"] = invalid
+            response_data["message"] = str(e)
+            response_data["message_detail"] = message_detail
+
+            return response_data
+
         except Exception as e:
             self.report_api_failure_metric(error_code=getattr(e, 'code', 0), exception_type=type(e).__name__)
             # 其他没有处理到的异常，默认发送失败
-            return {"username_check": {"invalid": receivers}, "message": str(e)}
+
+            response_data["username_check"]["invalid"] = receivers
+            response_data["message"] = str(e)
+            return response_data
+
+
+class UnityUserBaseResource(six.with_metaclass(abc.ABCMeta, APIResource)):
+    base_url = "%s/api/unity-user/stage/api/v1/open/odc-users/" % settings.BK_USERINFO_API_BASE_URL
+    module_name = "unity-user"
 
 
 class GetMsgType(CMSIBaseResource):
@@ -359,3 +425,16 @@ class SendWecomAPP(CheckCMSIResource):
         def validate(self, attrs):
             attrs[attrs["type"]] = {"content": attrs["content"]}
             return attrs
+
+
+class GetUserSensitiveInfo(UnityUserBaseResource):
+    """
+    获取用户敏感信息
+    """
+
+    action = "sensitive-info"
+    method = "GET"
+
+    class RequestSerializer(serializers.Serializer):
+        usernames = serializers.CharField(required=True)
+        fields = serializers.CharField(required=True)
